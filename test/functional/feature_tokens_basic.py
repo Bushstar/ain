@@ -62,6 +62,9 @@ class TokensBasicTest (DefiTestFramework):
             errorString = e.error['message']
         assert("token symbol should not contain '#'" in errorString)
 
+        # TODO: unlock outputs on previous failures
+        print("locked:", self.nodes[0].listlockunspent())
+        self.nodes[0].lockunspent(True)
         print ("Create token 'GOLD' (128)...")
         createTokenTx = self.nodes[0].createtoken({
             "symbol": "GOLD",

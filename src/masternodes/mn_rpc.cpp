@@ -11,6 +11,8 @@
 #include <core_io.h>
 #include <consensus/validation.h>
 #include <net.h>
+#include <policy/policy.h>
+#include <policy/settings.h>
 #include <rpc/client.h>
 #include <rpc/server.h>
 #include <rpc/protocol.h>
@@ -24,6 +26,7 @@
 
 //#ifdef ENABLE_WALLET
 #include <wallet/coincontrol.h>
+#include <wallet/fees.h>
 #include <wallet/ismine.h>
 #include <wallet/rpcwallet.h>
 #include <wallet/wallet.h>
@@ -43,17 +46,25 @@ extern UniValue getnewaddress(UniValue const& params, bool fHelp); // in rpcwall
 extern bool EnsureWalletIsAvailable(bool avoidException); // in rpcwallet.cpp
 extern bool DecodeHexTx(CTransaction& tx, std::string const& strHexTx); // in core_io.h
 
-extern void FundTransaction(CWallet* const pwallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position,
-                            UniValue options);
 
-static CMutableTransaction fund(CMutableTransaction _mtx, JSONRPCRequest const& request, CWallet* const pwallet) {
-    CMutableTransaction mtx = std::move(_mtx);
+static CMutableTransaction fund(CMutableTransaction & mtx, CWallet* const pwallet, CTransactionRef optAuthTx = {}) {
+//    CMutableTransaction mtx = std::move(_mtx);
     CAmount fee_out;
     int change_position = mtx.vout.size();
 
     std::string strFailReason;
     CCoinControl coinControl;
-    if (!pwallet->FundTransaction(mtx, fee_out, change_position, strFailReason, false /*lockUnspents*/,
+    // add outputs from possible linked auth tx into 'linkedCoins' pool
+    if (optAuthTx) {
+        for (size_t i = 0; i < optAuthTx->vout.size(); ++i) {
+            CTxOut const & out = optAuthTx->vout[i];
+            if (!out.scriptPubKey.IsUnspendable()) { // skip for possible metadata
+                coinControl.m_linkedCoins.emplace(COutPoint(optAuthTx->GetHash(), i), out);
+            }
+        }
+    }
+
+    if (!pwallet->FundTransaction(mtx, fee_out, change_position, strFailReason, true /*lockUnspents*/,
                                   std::set<int>() /*setSubtractFeeFromOutputs*/, coinControl)) {
         throw JSONRPCError(RPC_WALLET_ERROR, strFailReason);
     }
@@ -91,11 +102,65 @@ signsend(const CMutableTransaction& _mtx, JSONRPCRequest const& request, CWallet
     }
 }
 
-static int chainHeight(interfaces::Chain::Lock& locked_chain)
-{
-    if (auto height = locked_chain.getHeight())
-        return *height;
-    return 0;
+static CTransactionRef
+sign(CMutableTransaction& mtx, CWallet* const pwallet, CTransactionRef optAuthTx = {}) {
+
+    // assemble prevouts from optional linked tx
+    UniValue prevtxs(UniValue::VARR);
+    if (optAuthTx) {
+        for (size_t i = 0; i < optAuthTx->vout.size(); ++i) {
+            if (!optAuthTx->vout[i].scriptPubKey.IsUnspendable()) {
+                UniValue prevout(UniValue::VOBJ);
+                prevout.pushKV("txid", optAuthTx->GetHash().GetHex());
+                prevout.pushKV("vout", i);
+                prevout.pushKV("scriptPubKey", optAuthTx->vout[i].scriptPubKey.GetHex());
+                //prevout.pushKV("redeemScript", );
+                //prevout.pushKV("witnessScript", );
+                prevout.pushKV("amount", ValueFromAmount(optAuthTx->vout[i].nValue));
+                prevtxs.push_back(prevout);
+            }
+        }
+    }
+
+    /// from "signrawtransactionwithwallet":
+
+    // Fetch previous transactions (inputs):
+    std::map<COutPoint, Coin> coins;
+    for (const CTxIn& txin : mtx.vin) {
+        coins[txin.prevout]; // Create empty map entry keyed by prevout.
+    }
+    pwallet->chain().findCoins(coins);  // LOCK2(cs_main, ::mempool.cs);
+
+    UniValue signedVal = SignTransaction(mtx, prevtxs, pwallet, coins, false, {} /*hashType*/);
+    if (signedVal["complete"].getBool()) {
+        if (!DecodeHexTx(mtx, signedVal["hex"].get_str(), true)) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Can't decode signed auth TX");
+        }
+    }
+    else {
+        throw JSONRPCError(RPC_VERIFY_ERROR, "Can't sign TX: " + signedVal["errors"].write());
+    }
+    return MakeTransactionRef(std::move(mtx));
+}
+
+static CTransactionRef
+send(CTransactionRef tx, CTransactionRef optAuthTx) {
+
+    if (optAuthTx) {
+        send(optAuthTx, {});
+    }
+
+    // from "sendrawtransaction":
+    CAmount max_raw_tx_fee = {COIN / 10}; /// @todo check it with 0
+
+    std::string err_string;
+    AssertLockNotHeld(cs_main);
+    const TransactionError err = BroadcastTransaction(tx, err_string, max_raw_tx_fee, /*relay*/
+                                                      true, /*wait_callback*/ true);
+    if (TransactionError::OK != err) {
+        throw JSONRPCTransactionError(err, err_string);
+    }
+    return tx;
 }
 
 // returns either base58/bech32 address, or hex if format is unknown
@@ -105,6 +170,13 @@ std::string ScriptToString(CScript const& script) {
         return script.GetHex();
     }
     return EncodeDestination(dest);
+}
+
+static int chainHeight(interfaces::Chain::Lock& locked_chain)
+{
+    if (auto height = locked_chain.getHeight())
+        return *height;
+    return 0;
 }
 
 CAmount EstimateMnCreationFee(int targetHeight) {
@@ -133,7 +205,15 @@ std::vector<CTxIn> GetInputs(UniValue const& inputs) {
     return vin;
 }
 
-static std::vector<CTxIn> GetAuthInputs(CWallet* const pwallet, CTxDestination const& auth, UniValue const& explicitInputs) {
+boost::optional<CScript> AmIFounder(CWallet* const pwallet) {
+    for(auto const & script : Params().GetConsensus().foundationMembers) {
+        if(IsMine(*pwallet, script) == ISMINE_SPENDABLE)
+            return { script };
+    }
+    return {};
+}
+
+static std::vector<CTxIn> GetAuthInputsOold(CWallet* const pwallet, CTxDestination const& auth, UniValue const& explicitInputs) {
     std::vector<CTxIn> vin{};
     if (!explicitInputs.empty()) {
         return GetInputs(explicitInputs.get_array());
@@ -161,6 +241,119 @@ static std::vector<CTxIn> GetAuthInputs(CWallet* const pwallet, CTxDestination c
     }
     return vin;
 }
+
+static boost::optional<CTxIn> GetAuthInputOnly(CWallet* const pwallet, CTxDestination const& auth) {
+
+    std::vector<COutput> vecOutputs;
+    CCoinControl cctl;
+    cctl.m_avoid_address_reuse = false;
+    cctl.m_min_depth = 1;
+    cctl.m_max_depth = 999999999;
+    cctl.matchDestination = auth;
+    cctl.m_tokenFilter = {DCT_ID{0}};
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+    auto locked_chain = pwallet->chain().lock();
+    LOCK(pwallet->cs_wallet);
+
+    pwallet->AvailableCoins(*locked_chain, vecOutputs, true, &cctl, 1, MAX_MONEY, MAX_MONEY, 1);
+
+    if (vecOutputs.empty()) {
+//        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, strprintf(
+//                "Can't find any UTXO's for owner. Are you an owner? If so, send some coins to address %s and try again!",
+//                EncodeDestination(auth)));
+        return {};
+    }
+    return { CTxIn(vecOutputs[0].tx->GetHash(), vecOutputs[0].i) };
+}
+
+CTransactionRef CreateAuthTx(CWallet* const pwallet, std::set<CScript> const & auths, int32_t txVersion) {
+    CMutableTransaction mtx(txVersion);
+
+    // may be use this rates instead of ::dustRelayFee???
+//    FeeCalculation feeCalc;
+//    CFeeRate nFeeRateNeeded = GetMinimumFeeRate(*pwallet, {}, &feeCalc);
+
+    // create tx with one dust output per script
+    for (auto const & auth : auths) {
+        CTxOut authOut(CAmount(1), auth);
+        authOut.nValue = GetDustThreshold(authOut, mtx.nVersion, ::dustRelayFee);
+        mtx.vout.push_back(authOut);
+    }
+
+    fund(mtx, pwallet);
+    return sign(mtx, pwallet);
+}
+
+static boost::optional<CTxIn> GetAnyFoundationAuthInput(CWallet* const pwallet) {
+    CScript anyFounder;
+    for (auto const & founderScript : Params().GetConsensus().foundationMembers) {
+        if (IsMine(*pwallet, founderScript) == ISMINE_SPENDABLE) {
+            CTxDestination destination;
+            if (ExtractDestination(founderScript, destination)) {
+                anyFounder = founderScript;
+                auto auth = GetAuthInputOnly(pwallet, destination);
+                if (auth) {
+                    return auth;
+                }
+            }
+        }
+    }
+    return {};
+}
+
+static std::vector<CTxIn> GetAuthInputsSmart(CWallet* const pwallet, int32_t txVersion, std::set<CScript> const & auths, bool needFounderAuth, CTransactionRef & optAuthTx) {
+    std::vector<CTxIn> result;
+
+    std::set<CScript> notFoundYet;
+    // first, look for "common" auth inputs, tracking missed
+    for (auto const & auth : auths) {
+        CTxDestination destination;
+        if (!ExtractDestination(auth, destination)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Can't extract destination for " + auth.GetHex());
+        }
+        auto authInput = GetAuthInputOnly(pwallet, destination);
+        if (authInput) {
+            result.push_back(authInput.get());
+        }
+        else {
+            notFoundYet.insert(auth);
+        }
+    }
+    // next, look for founder's auth inputs
+    if (needFounderAuth) {
+        auto anyFounder = AmIFounder(pwallet);
+        if (!anyFounder) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Need foundation member authorization");
+        }
+        auto authInput = GetAnyFoundationAuthInput(pwallet);
+        if (authInput) {
+            if (std::find(result.begin(), result.end(), *authInput) == result.end())
+                result.push_back(authInput.get());
+        }
+        else {
+            notFoundYet.insert(anyFounder.get());
+        }
+    }
+
+    /// @todo need to determine the best way: insert all ot the inputs here, or leave that job for the following "fund"?
+    // at last, create additional tx for missed
+    if (!notFoundYet.empty()) {
+        try {
+            optAuthTx = CreateAuthTx(pwallet, notFoundYet, txVersion); // success or throw
+        } catch (const UniValue& objError) {
+            throw JSONRPCError(objError["code"].get_int(), "Add-on auth TX failed: " + objError["message"].getValStr());
+        }
+        // if we are here - we've got signed optional auth tx - add all of the outputs into inputs (to do not miss any coins for sure)
+        for (size_t i = 0; i < optAuthTx->vout.size(); ++i) {
+            if (!optAuthTx->vout[i].scriptPubKey.IsUnspendable())
+                result.push_back(CTxIn(optAuthTx->GetHash(), i));
+        }
+    }
+
+    return result;
+}
+
 
 static CWallet* GetWallet(const JSONRPCRequest& request) {
     std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
@@ -247,7 +440,7 @@ UniValue createmasternode(const JSONRPCRequest& request) {
     rawTx.vout.push_back(CTxOut(EstimateMnCreationFee(targetHeight), scriptMeta));
     rawTx.vout.push_back(CTxOut(GetMnCollateralAmount(), GetScriptForDestination(ownerDest)));
 
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -312,12 +505,22 @@ UniValue resignmasternode(const JSONRPCRequest& request) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("The masternode %s does not exist", nodeIdStr));
         }
         ownerDest = nodePtr->ownerType == 1 ? CTxDestination(PKHash(nodePtr->ownerAuthAddress)) : CTxDestination(WitnessV0KeyHash(nodePtr->ownerAuthAddress));
+
         targetHeight = ::ChainActive().Height() + 1;
     }
 
     const auto txVersion = GetTransactionVersion(targetHeight);
     CMutableTransaction rawTx(txVersion);
-    rawTx.vin = GetAuthInputs(pwallet, ownerDest, request.params.size() > 1 ? request.params[1].get_array() : UniValue(UniValue::VARR));
+
+    UniValue txInputs = request.params[1];
+    CTransactionRef optAuthTx;
+    if (!txInputs.empty()) {
+        rawTx.vin = GetInputs(txInputs);
+    }
+    else {
+        rawTx.vin = GetAuthInputsSmart(pwallet, rawTx.nVersion, { GetScriptForDestination(ownerDest) }, false, optAuthTx);
+    }
+//    rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, request.params.size() > 1 ? request.params[1].get_array() : UniValue(UniValue::VARR));
 
     CDataStream metadata(DfTxMarker, SER_NETWORK, PROTOCOL_VERSION);
     metadata << static_cast<unsigned char>(CustomTxType::ResignMasternode)
@@ -328,19 +531,25 @@ UniValue resignmasternode(const JSONRPCRequest& request) {
 
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
-    rawTx = fund(rawTx, request, pwallet);
+    fund(rawTx, pwallet, optAuthTx);
 
     // check execution
     {
         LOCK(cs_main);
         CCustomCSView mnview_dummy(*pcustomcsview); // don't write into actual DB
-        const auto res = ApplyResignMasternodeTx(mnview_dummy, ::ChainstateActive().CoinsTip(), CTransaction(rawTx), targetHeight,
+        CCoinsViewCache coinview(&::ChainstateActive().CoinsTip());
+        if (optAuthTx)
+            AddCoins(coinview, *optAuthTx, targetHeight);
+        const auto res = ApplyResignMasternodeTx(mnview_dummy, coinview, CTransaction(rawTx), targetHeight,
                                       ToByteVector(CDataStream{SER_NETWORK, PROTOCOL_VERSION, nodeId}));
         if (!res.ok) {
+            /// @todo unlock
             throw JSONRPCError(RPC_INVALID_REQUEST, "Execution test failed:\n" + res.msg);
         }
     }
-    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
+    auto signedTx = sign(rawTx, pwallet, optAuthTx);
+    return send(signedTx, optAuthTx)->GetHash().GetHex();
+//    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
 }
 
 // Here (but not a class method) just by similarity with other '..ToJSON'
@@ -636,24 +845,26 @@ UniValue createtoken(const JSONRPCRequest& request) {
     const auto txVersion = GetTransactionVersion(targetHeight);
     CMutableTransaction rawTx(txVersion);
 
+    CTransactionRef optAuthTx;
     if(metaObj["isDAT"].getBool())
     {
-        for(std::set<CScript>::iterator it = Params().GetConsensus().foundationMembers.begin(); it != Params().GetConsensus().foundationMembers.end() && rawTx.vin.size() == 0; it++)
-        {
-            if(IsMine(*pwallet, *it) == ISMINE_SPENDABLE)
-            {
-                CTxDestination destination;
-                if (!ExtractDestination(*it, destination)) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
-                }
-                try {
-                    rawTx.vin = GetAuthInputs(pwallet, destination, txInputs.get_array());
-                }
-                catch (const UniValue& objError) {}
-            }
-        }
-        if(rawTx.vin.size() == 0)
-            throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
+//        for(std::set<CScript>::iterator it = Params().GetConsensus().foundationMembers.begin(); it != Params().GetConsensus().foundationMembers.end() && rawTx.vin.size() == 0; it++)
+//        {
+//            if(IsMine(*pwallet, *it) == ISMINE_SPENDABLE)
+//            {
+//                CTxDestination destination;
+//                if (!ExtractDestination(*it, destination)) {
+//                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
+//                }
+//                try {
+//                    rawTx.vin = GetAuthInputsOld(pwallet, destination, txInputs.get_array());
+//                }
+//                catch (const UniValue& objError) {}
+//            }
+//        }
+//        if(rawTx.vin.size() == 0)
+//            throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
+        rawTx.vin = GetAuthInputsSmart(pwallet, rawTx.nVersion, {}, true /*needFoundersAuth*/, optAuthTx);
     }
     else
         rawTx.vin = GetInputs(txInputs.get_array());
@@ -661,19 +872,23 @@ UniValue createtoken(const JSONRPCRequest& request) {
     rawTx.vout.push_back(CTxOut(GetTokenCreationFee(targetHeight), scriptMeta));
     rawTx.vout.push_back(CTxOut(GetTokenCollateralAmount(), GetScriptForDestination(collateralDest)));
 
-    rawTx = fund(rawTx, request, pwallet);
+    fund(rawTx, pwallet, optAuthTx);
 
     // check execution
     {
         LOCK(cs_main);
         CCustomCSView mnview_dummy(*pcustomcsview); // don't write into actual DB
-        const auto res = ApplyCreateTokenTx(mnview_dummy, g_chainstate->CoinsTip(), CTransaction(rawTx), targetHeight,
+        CCoinsViewCache coinview(&::ChainstateActive().CoinsTip());
+        const auto res = ApplyCreateTokenTx(mnview_dummy, coinview, CTransaction(rawTx), targetHeight,
                                       ToByteVector(CDataStream{SER_NETWORK, PROTOCOL_VERSION, token}), Params().GetConsensus());
         if (!res.ok) {
             throw JSONRPCError(RPC_INVALID_REQUEST, "Execution test failed:\n" + res.msg);
         }
     }
-    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
+    auto signedTx = sign(rawTx, pwallet, optAuthTx);
+    return send(signedTx, optAuthTx)->GetHash().GetHex();
+
+//    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
 }
 
 UniValue updatetoken(const JSONRPCRequest& request) {
@@ -826,7 +1041,7 @@ UniValue updatetoken(const JSONRPCRequest& request) {
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
                 }
                 try {
-                    rawTx.vin = GetAuthInputs(pwallet, destination, txInputs.get_array());
+                    rawTx.vin = GetAuthInputsOld(pwallet, destination, txInputs.get_array());
                 }
                 catch (const UniValue& objError) {}
             }
@@ -850,7 +1065,7 @@ UniValue updatetoken(const JSONRPCRequest& request) {
                         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
                     }
                     try {
-                        rawTx.vin = GetAuthInputs(pwallet, destination, txInputs.get_array());
+                        rawTx.vin = GetAuthInputsOld(pwallet, destination, txInputs.get_array());
                     }
                     catch (const UniValue& objError) {}
                 }
@@ -859,7 +1074,7 @@ UniValue updatetoken(const JSONRPCRequest& request) {
                 throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
         }
         else // "common" auth
-            rawTx.vin = GetAuthInputs(pwallet, ownerDest, UniValue(UniValue::VARR));
+            rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, UniValue(UniValue::VARR));
     }
 
     CDataStream metadata(DfTxMarker, SER_NETWORK, PROTOCOL_VERSION);
@@ -879,7 +1094,7 @@ UniValue updatetoken(const JSONRPCRequest& request) {
 
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -1082,6 +1297,7 @@ UniValue minttokens(const JSONRPCRequest& request) {
 
     const auto txVersion = GetTransactionVersion(targetHeight);
     CMutableTransaction rawTx(txVersion);
+    CTransactionRef optAuthTx;
 
     // auth
     {
@@ -1089,7 +1305,8 @@ UniValue minttokens(const JSONRPCRequest& request) {
             rawTx.vin = GetInputs(txInputs);
         }
         else {
-            bool gotFoundersAuth = false;
+            bool needFoundersAuth = false;
+            std::set<CScript> auths;
             for (auto const & kv : minted.balances) {
 
                 CTokenImplementation tokenImpl;
@@ -1107,41 +1324,26 @@ UniValue minttokens(const JSONRPCRequest& request) {
                         throw JSONRPCError(RPC_INVALID_PARAMETER,
                                            strprintf("Can't extract destination for token's %s collateral", tokenImpl.symbol));
                     }
-                }
-
-                /// @note that there is no need to handle BayfrontHeight here cause (in the worst case) it'll be declined at Apply*; the rest parts are compatible
-
-                // use different auth for DAT|nonDAT tokens:
-                // first, try to auth by exect owner
-                auto auths = GetAuthInputs(pwallet, ownerDest, UniValue(UniValue::VARR));
-
-                if(tokenImpl.IsDAT() && auths.size() == 0 && !gotFoundersAuth) // try "founders auth" only if "common" fails:
-                {
-                    for(std::set<CScript>::iterator it = Params().GetConsensus().foundationMembers.begin(); it != Params().GetConsensus().foundationMembers.end() && auths.size() == 0; it++)
-                    {
-                        if(IsMine(*pwallet, *it) == ISMINE_SPENDABLE)
-                        {
-                            CTxDestination destination;
-                            if (!ExtractDestination(*it, destination)) {
-                                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
-                            }
-                            try {
-                                auths = GetAuthInputs(pwallet, destination, UniValue(UniValue::VARR));
-                            }
-                            catch (const UniValue& objError) {}
-                        }
+                    if (tokenImpl.IsDAT()) {
+                        needFoundersAuth = true;
                     }
-                    if(auths.size() == 0)
-                        throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
-                    gotFoundersAuth = true; // we need only one any utxo from founder
-                }
+                    else {
+                        auths.insert(authCoin.out.scriptPubKey);
+                    }
 
-                for (const auto& auth : auths) {
-                    if (std::find(rawTx.vin.begin(), rawTx.vin.end(), auth) == rawTx.vin.end()) {
-                        rawTx.vin.push_back(auth);
+                    // optional, for verbose UX
+                    if (IsMine(*pwallet, authCoin.out.scriptPubKey) != ISMINE_SPENDABLE) {
+                        if (tokenImpl.IsDAT() && !AmIFounder(pwallet)) {
+                            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                               strprintf("Token %s needs foundation auth. You are not a foundation member!", tokenImpl.symbol));
+                        }
+                        else {
+                            throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
+                        }
                     }
                 }
             }
+            rawTx.vin = GetAuthInputsSmart(pwallet, rawTx.nVersion, auths, needFoundersAuth, optAuthTx);
         } // else
     }
 
@@ -1155,20 +1357,24 @@ UniValue minttokens(const JSONRPCRequest& request) {
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    fund(rawTx, pwallet, optAuthTx);
 
     // check execution
     {
         LOCK(cs_main);
         CCustomCSView mnview_dummy(*pcustomcsview); // don't write into actual DB
-        const auto res = ApplyMintTokenTx(mnview_dummy, g_chainstate->CoinsTip(), CTransaction(rawTx), targetHeight,
+        CCoinsViewCache view(&::ChainstateActive().CoinsTip());
+        if (optAuthTx)
+            AddCoins(view, *optAuthTx, targetHeight);
+        const auto res = ApplyMintTokenTx(mnview_dummy, view, CTransaction(rawTx), targetHeight,
                                                  ToByteVector(CDataStream{SER_NETWORK, PROTOCOL_VERSION, minted }), Params().GetConsensus());
         if (!res.ok) {
+            /// @todo unlock
             throw JSONRPCError(RPC_INVALID_REQUEST, "Execution test failed:\n" + res.msg);
         }
     }
-
-    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
+    auto signedTx = sign(rawTx, pwallet, optAuthTx);
+    return send(signedTx, optAuthTx)->GetHash().GetHex();
 }
 
 CScript hexToScript(std::string const& str) {
@@ -1726,14 +1932,14 @@ UniValue addpoolliquidity(const JSONRPCRequest& request) {
         txInputs.setArray();
     }
     if (!txInputs.get_array().empty()) {
-        rawTx.vin = GetAuthInputs(pwallet, ownerDest, txInputs.get_array());
+        rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, txInputs.get_array());
     } else {
         for (const auto& kv : msg.from) {
             if (!ExtractDestination(kv.first, ownerDest)) {
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid owner destination");
             }
 
-            std::vector<CTxIn> auths = GetAuthInputs(pwallet, ownerDest, UniValue(UniValue::VARR));
+            std::vector<CTxIn> auths = GetAuthInputsOld(pwallet, ownerDest, UniValue(UniValue::VARR));
             for (const auto& auth : auths) {
                 if (std::find(rawTx.vin.begin(), rawTx.vin.end(), auth) == rawTx.vin.end()) {
                     rawTx.vin.push_back(auth);
@@ -1743,7 +1949,7 @@ UniValue addpoolliquidity(const JSONRPCRequest& request) {
     }
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -1826,10 +2032,10 @@ UniValue removepoolliquidity(const JSONRPCRequest& request) {
     {
         txInputs.setArray();
     }
-    rawTx.vin = GetAuthInputs(pwallet, ownerDest, txInputs.get_array());
+    rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, txInputs.get_array());
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -1920,7 +2126,7 @@ UniValue utxostoaccount(const JSONRPCRequest& request) {
     }
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -2011,10 +2217,10 @@ UniValue accounttoaccount(const JSONRPCRequest& request) {
     {
         txInputs.setArray();
     }
-    rawTx.vin = GetAuthInputs(pwallet, ownerDest, txInputs.get_array());
+    rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, txInputs.get_array());
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -2112,12 +2318,12 @@ UniValue accounttoutxos(const JSONRPCRequest& request) {
     {
         txInputs.setArray();
     }
-    rawTx.vin = GetAuthInputs(pwallet, ownerDest, txInputs.get_array());
+    rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, txInputs.get_array());
 
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // re-encode with filled mintingOutputsStart
     {
@@ -2292,7 +2498,7 @@ UniValue createpoolpair(const JSONRPCRequest& request) {
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
             }
             try {
-                rawTx.vin = GetAuthInputs(pwallet, destination, txInputs.get_array());
+                rawTx.vin = GetAuthInputsOld(pwallet, destination, txInputs.get_array());
             }
             catch (const UniValue& objError) {}
         }
@@ -2300,7 +2506,7 @@ UniValue createpoolpair(const JSONRPCRequest& request) {
     if(rawTx.vin.size() == 0)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
 
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -2411,7 +2617,7 @@ UniValue updatepoolpair(const JSONRPCRequest& request) {
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
             }
             try {
-                rawTx.vin = GetAuthInputs(pwallet, destination, request.params.size() > 1 ? request.params[1].get_array() : UniValue());
+                rawTx.vin = GetAuthInputsOld(pwallet, destination, request.params.size() > 1 ? request.params[1].get_array() : UniValue());
             }
             catch (const UniValue& objError) {}
         }
@@ -2428,7 +2634,7 @@ UniValue updatepoolpair(const JSONRPCRequest& request) {
 
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -2594,10 +2800,10 @@ UniValue poolswap(const JSONRPCRequest& request) {
     {
         txInputs.setArray();
     }
-    rawTx.vin = GetAuthInputs(pwallet, ownerDest, txInputs.get_array());
+    rawTx.vin = GetAuthInputsOld(pwallet, ownerDest, txInputs.get_array());
 
     // fund
-    rawTx = fund(rawTx, request, pwallet);
+    rawTx = fund(rawTx, pwallet);
 
     // check execution
     {
@@ -2990,36 +3196,49 @@ UniValue setgov(const JSONRPCRequest& request) {
     CMutableTransaction rawTx(txVersion);
     rawTx.vout.push_back(CTxOut(0, scriptMeta));
 
-    for(std::set<CScript>::iterator it = Params().GetConsensus().foundationMembers.begin(); it != Params().GetConsensus().foundationMembers.end() && rawTx.vin.size() == 0; it++)
-    {
-        if(IsMine(*pwallet, *it) == ISMINE_SPENDABLE)
-        {
-            CTxDestination destination;
-            if (!ExtractDestination(*it, destination)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
-            }
-            try {
-                rawTx.vin = GetAuthInputs(pwallet, destination, request.params.size() > 1 ? request.params[2].get_array() : UniValue());
-            }
-            catch (const UniValue& objError) {}
-        }
-    }
-    if(rawTx.vin.size() == 0)
-        throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
+//    for(std::set<CScript>::iterator it = Params().GetConsensus().foundationMembers.begin(); it != Params().GetConsensus().foundationMembers.end() && rawTx.vin.size() == 0; it++)
+//    {
+//        if(IsMine(*pwallet, *it) == ISMINE_SPENDABLE)
+//        {
+//            CTxDestination destination;
+//            if (!ExtractDestination(*it, destination)) {
+//                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid destination");
+//            }
+//            try {
+//                rawTx.vin = GetAuthInputsOld(pwallet, destination, request.params.size() > 1 ? request.params[2].get_array() : UniValue());
+//            }
+//            catch (const UniValue& objError) {}
+//        }
+//    }
+//    if(rawTx.vin.size() == 0)
+//        throw JSONRPCError(RPC_INVALID_REQUEST, "Incorrect Authorization");
 
-    rawTx = fund(rawTx, request, pwallet);
+    UniValue txInputs = request.params[1];
+    CTransactionRef optAuthTx;
+    if (!txInputs.empty()) {
+        rawTx.vin = GetInputs(txInputs);
+    }
+    else {
+        rawTx.vin = GetAuthInputsSmart(pwallet, rawTx.nVersion, {}, true /*needFoundersAuth*/, optAuthTx);
+    }
+
+    fund(rawTx, pwallet, optAuthTx);
 
     // check execution
     {
         LOCK(cs_main);
         CCustomCSView mnview_dummy(*pcustomcsview); // don't write into actual DB
-        const auto res = ApplySetGovernanceTx(mnview_dummy, g_chainstate->CoinsTip(), CTransaction(rawTx), targetHeight,
+        CCoinsViewCache coinview(&::ChainstateActive().CoinsTip());
+        const auto res = ApplySetGovernanceTx(mnview_dummy, coinview, CTransaction(rawTx), targetHeight,
                                       ToByteVector(varStream), Params().GetConsensus());
         if (!res.ok) {
+            /// @todo unlock
             throw JSONRPCError(RPC_INVALID_REQUEST, "Execution test failed:\n" + res.msg);
         }
     }
-    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
+//    return signsend(rawTx, request, pwallet)->GetHash().GetHex();
+    auto signedTx = sign(rawTx, pwallet, optAuthTx);
+    return send(signedTx, optAuthTx)->GetHash().GetHex();
 }
 
 UniValue getgov(const JSONRPCRequest& request) {

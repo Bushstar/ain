@@ -147,7 +147,7 @@ Res ApplyCustomTx(CCustomCSView & base_mnview, CCoinsViewCache const & coins, CT
                 res = ApplyUpdateTokenAnyTx(mnview, coins, tx, height, metadata, consensusParams);
                 break;
             case CustomTxType::MintToken:
-                res = ApplyMintTokenTx(mnview, coins, tx, height, metadata, consensusParams);
+                res = ApplyMintTokenTx(mnview, coins, tx, height, metadata, consensusParams);           //
                 break;
             case CustomTxType::CreatePoolPair:
                 res = ApplyCreatePoolPairTx(mnview, coins, tx, height, metadata, consensusParams);
